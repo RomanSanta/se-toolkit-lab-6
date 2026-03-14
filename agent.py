@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Documentation Agent CLI — Call an LLM with tools and return a structured JSON answer.
+System Agent CLI — Call an LLM with tools (read_file, list_files, query_api) and return a structured JSON answer.
 
 Usage:
-    uv run agent.py "How do you resolve a merge conflict?"
+    uv run agent.py "How many items are in the database?"
 
 Output:
     {
       "answer": "...",
-      "source": "wiki/git-workflow.md#resolving-merge-conflicts",
+      "source": "wiki/git-workflow.md#section",
       "tool_calls": [...]
     }
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -30,11 +31,16 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 
 
 class AgentSettings(BaseSettings):
-    """Load LLM configuration from .env.agent.secret."""
+    """Load LLM and backend configuration from environment."""
 
+    # LLM configuration
     llm_api_key: str = Field(alias="LLM_API_KEY")
     llm_api_base: str = Field(alias="LLM_API_BASE")
     llm_model: str = Field(alias="LLM_MODEL")
+
+    # Backend API configuration
+    lms_api_key: str = Field(default="", alias="LMS_API_KEY")
+    agent_api_base_url: str = Field(default="http://localhost:42002", alias="AGENT_API_BASE_URL")
 
     model_config = SettingsConfigDict(
         env_file=".env.agent.secret",
@@ -46,12 +52,12 @@ class AgentSettings(BaseSettings):
 
 def load_settings() -> AgentSettings:
     """Load and validate agent settings."""
+    # Try to load from .env.agent.secret first
     env_file = PROJECT_ROOT / ".env.agent.secret"
-    if not env_file.exists():
-        print(f"Error: {env_file} not found", file=sys.stderr)
-        sys.exit(1)
-
-    return AgentSettings(_env_file=env_file)
+    if env_file.exists():
+        return AgentSettings(_env_file=env_file)
+    # Fall back to environment variables only
+    return AgentSettings()
 
 
 def validate_path(path: str) -> tuple[bool, str]:
@@ -136,19 +142,64 @@ def list_files(path: str) -> dict[str, Any]:
         return {"success": False, "error": f"Error listing directory: {e}"}
 
 
+def query_api(method: str, path: str, body: str | None = None) -> dict[str, Any]:
+    """
+    Call the backend API.
+
+    Args:
+        method: HTTP method (GET, POST, etc.)
+        path: API path (e.g., /items/)
+        body: Optional JSON request body
+
+    Returns:
+        Dict with 'success', 'status_code', and 'body' or 'error' keys.
+    """
+    api_base = os.environ.get("AGENT_API_BASE_URL", "http://localhost:42002")
+    api_key = os.environ.get("LMS_API_KEY", "")
+
+    url = f"{api_base.rstrip('/')}{path}"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            if method.upper() == "GET":
+                response = client.get(url, headers=headers)
+            elif method.upper() == "POST":
+                response = client.post(url, headers=headers, data=body or "{}")
+            else:
+                return {"success": False, "error": f"Unsupported method: {method}"}
+
+            result = {
+                "success": True,
+                "status_code": response.status_code,
+                "body": response.text,
+            }
+            return result
+
+    except httpx.TimeoutException:
+        return {"success": False, "error": "API request timed out (30s)"}
+    except httpx.HTTPError as e:
+        return {"success": False, "error": f"HTTP error: {e}"}
+    except Exception as e:
+        return {"success": False, "error": f"Error: {e}"}
+
+
 # Tool definitions for LLM function calling
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a file from the project repository. Use this to read documentation, code, or any other file.",
+            "description": "Read the contents of a file from the project repository. Use this to read documentation, code, or config files.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path from project root (e.g., 'wiki/git-workflow.md')"
+                        "description": "Relative path from project root (e.g., 'wiki/git-workflow.md', 'backend/app/main.py')"
                     }
                 },
                 "required": ["path"]
@@ -159,16 +210,41 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and directories in a directory. Use this to discover what files exist in a directory.",
+            "description": "List files and directories in a directory. Use this to discover what files exist.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative directory path from project root (e.g., 'wiki')"
+                        "description": "Relative directory path from project root (e.g., 'wiki', 'backend/app/routers')"
                     }
                 },
                 "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Call the backend API to query data or check system status. Use this for questions about database contents, item counts, scores, or API behavior.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method (GET, POST, etc.)"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API path (e.g., '/items/', '/analytics/completion-rate')"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON request body for POST requests"
+                    }
+                },
+                "required": ["method", "path"]
             }
         }
     }
@@ -178,19 +254,28 @@ TOOLS = [
 TOOL_FUNCTIONS = {
     "read_file": read_file,
     "list_files": list_files,
+    "query_api": query_api,
 }
 
-SYSTEM_PROMPT = """You are a documentation assistant for a software engineering toolkit.
-You have access to tools that let you read files and list directories in the project.
+SYSTEM_PROMPT = """You are a system assistant for a software engineering toolkit.
+You have access to three tools:
 
-When answering questions:
-1. Use `list_files` to discover relevant files in directories like 'wiki/' or 'lab/'
-2. Use `read_file` to read the contents of files
-3. Find the answer in the file contents
-4. Include a source reference in your answer: the file path and section anchor (e.g., "wiki/git-workflow.md#resolving-merge-conflicts")
-5. Once you have found the answer, provide it directly without more tool calls
+1. `list_files` - List files in a directory
+2. `read_file` - Read contents of a file
+3. `query_api` - Call the backend API to query data
 
-Be concise and accurate. Always cite your sources."""
+Tool selection guide:
+- For wiki/how-to questions: Use `list_files` to find files, then `read_file` to read them
+- For code questions (framework, ports, etc.): Use `read_file` on source code
+- For data questions (item count, scores, etc.): Use `query_api`
+- For API behavior questions (status codes, errors): Use `query_api`
+- For bug diagnosis: Use `query_api` to reproduce the error, then `read_file` to examine source code
+
+When answering:
+1. Use the appropriate tool(s) to find the answer
+2. Include a source reference if applicable (file path + section anchor)
+3. Be concise and accurate
+4. Once you have the answer, provide it directly without more tool calls"""
 
 
 def execute_tool(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -251,7 +336,7 @@ def call_llm_with_tools(
 
                 if not tool_calls:
                     # No tool calls - LLM provided final answer
-                    answer = message.get("content", "")
+                    answer = message.get("content") or ""
                     # Extract source from answer (look for file references)
                     source = extract_source(answer)
                     return answer, source, tool_calls_log
@@ -311,6 +396,13 @@ def format_tool_result(result: dict[str, Any]) -> str:
             return content
         elif "entries" in result:
             return "\n".join(result["entries"])
+        elif "body" in result:
+            # API response - show status code and truncated body
+            status = result.get("status_code", "?")
+            body = result["body"]
+            if len(body) > 500:
+                body = body[:500] + "... (truncated)"
+            return f"Status: {status}\nBody: {body}"
     return f"Error: {result.get('error', 'Unknown error')}"
 
 
@@ -329,6 +421,11 @@ def extract_source(answer: str) -> str:
 
     # Look for lab references
     match = re.search(r"(lab/[\w\-/]+\.md(?:#[\w\-]+)?)", answer)
+    if match:
+        return match.group(1)
+
+    # Look for backend file references
+    match = re.search(r"(backend/[\w\-/]+\.(?:py|yml|yaml|toml)(?:#[\w\-]+)?)", answer)
     if match:
         return match.group(1)
 
