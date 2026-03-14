@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project implements a CLI agent (`agent.py`) that answers questions by calling an LLM API. This is Task 1 of Lab 6 — the foundation for building a full documentation agent with tools in Tasks 2–3.
+This project implements a CLI documentation agent (`agent.py`) that answers questions by calling an LLM API with tools. The agent can read files and list directories to find answers in the project documentation.
 
 ## Architecture
 
@@ -10,7 +10,7 @@ This project implements a CLI agent (`agent.py`) that answers questions by calli
 
 - **Provider:** Qwen Code API (self-hosted on VM)
 - **Model:** `qwen3-coder-plus`
-- **API Format:** OpenAI-compatible chat completions
+- **API Format:** OpenAI-compatible chat completions with tool calling
 
 ### Configuration
 
@@ -22,44 +22,96 @@ LLM_API_BASE=http://<vm-ip>:<port>/v1
 LLM_MODEL=qwen3-coder-plus
 ```
 
-### Flow
+### Agentic Loop
 
 ```
-User question → agent.py → LLM API → JSON answer
+User question → LLM (with tools) → tool_calls?
+    │
+    ├─yes→ Execute tools → Append results as "tool" messages → Loop back
+    │
+    └─no→ Final answer → Extract answer + source → Output JSON
 ```
 
-1. Parse CLI argument (question)
-2. Load settings from `.env.agent.secret`
-3. Call LLM via HTTP POST to `/chat/completions`
-4. Extract answer from response
-5. Output JSON to stdout
+1. Send user question + system prompt + tool definitions to LLM
+2. Parse response:
+   - If `tool_calls` present: execute each tool, append results, repeat (max 10 iterations)
+   - If no tool calls: extract answer from message content
+3. Output JSON with `answer`, `source`, `tool_calls`
+
+## Tools
+
+### `read_file`
+
+Read the contents of a file from the project repository.
+
+**Parameters:**
+- `path` (string, required): Relative path from project root
+
+**Returns:**
+```json
+{"success": true, "content": "..."}
+// or
+{"success": false, "error": "..."}
+```
+
+**Security:** Rejects absolute paths and paths containing `..` (directory traversal).
+
+### `list_files`
+
+List files and directories at a given path.
+
+**Parameters:**
+- `path` (string, required): Relative directory path from project root
+
+**Returns:**
+```json
+{"success": true, "entries": ["file1.md", "file2.md", ...]}
+// or
+{"success": false, "error": "..."}
+```
+
+**Security:** Rejects absolute paths and paths containing `..` (directory traversal).
 
 ## Usage
 
 ### Basic Usage
 
 ```bash
-uv run agent.py "What does REST stand for?"
+uv run agent.py "How do you resolve a merge conflict?"
 ```
 
 ### Output Format
 
-The agent outputs a single JSON line to stdout:
-
 ```json
-{"answer": "Representational State Transfer.", "tool_calls": []}
+{
+  "answer": "Edit the conflicting file, choose which changes to keep, then stage and commit.",
+  "source": "wiki/git-workflow.md#resolving-merge-conflicts",
+  "tool_calls": [
+    {
+      "tool": "list_files",
+      "args": {"path": "wiki"},
+      "result": "git-workflow.md\n..."
+    },
+    {
+      "tool": "read_file",
+      "args": {"path": "wiki/git-workflow.md"},
+      "result": "..."
+    }
+  ]
+}
 ```
 
-Fields:
-- `answer` (string): The LLM's response
-- `tool_calls` (array): Empty for Task 1 (populated in Task 2)
+**Fields:**
+- `answer` (string): The LLM's final answer
+- `source` (string): Reference to the wiki section (e.g., `wiki/git-workflow.md#section`)
+- `tool_calls` (array): All tool calls made during execution
 
 All debug/error output goes to stderr.
 
 ### Exit Codes
 
 - `0`: Success
-- Non-zero: Error (missing config, network error, timeout, etc.)
+- Non-zero: Error (missing config, network error, timeout, max tool calls reached, etc.)
 
 ## Implementation Details
 
@@ -71,49 +123,47 @@ All debug/error output goes to stderr.
 
 ### System Prompt
 
-A minimal system prompt instructs the LLM to answer directly without tool calls:
+The system prompt instructs the LLM to:
 
-```
-You are a helpful assistant. Answer questions directly and concisely.
-Do not use tool calls — just provide the answer.
-```
+1. Use `list_files` to discover relevant files in directories like `wiki/` or `lab/`
+2. Use `read_file` to read the contents of files
+3. Find the answer in the file contents
+4. Include a source reference in the answer
+5. Stop calling tools once the answer is found
+
+### Tool Call Limit
+
+Maximum 10 tool calls per question to prevent infinite loops.
 
 ### Timeout
 
-The HTTP request has a 60-second timeout to meet the acceptance criteria.
+The HTTP request has a 60-second timeout.
 
 ## Testing
 
-### Manual Test
+### Manual Tests
 
 ```bash
-uv run agent.py "What is 2+2?"
+# Test list_files tool
+uv run agent.py "What files are in the wiki directory?"
+
+# Test read_file tool
+uv run agent.py "How do you resolve a merge conflict?"
 ```
 
-Expected output:
-```json
-{"answer": "2 + 2 = 4.", "tool_calls": []}
-```
+### Automated Tests
 
-### Automated Test
-
-Run the regression test:
+Run the regression tests:
 
 ```bash
-uv run pytest backend/tests/unit/test_agent.py -v
+uv run pytest tests/test_agent.py -v
 ```
-
-## Next Steps (Tasks 2–3)
-
-In the next tasks, the agent will be extended with:
-
-1. **Tools:** `read_file`, `list_files`, `query_api`
-2. **Agentic loop:** User input → LLM → tool call → execute → feed result → repeat
-3. **Domain knowledge:** System prompt with documentation context
 
 ## Files
 
-- `agent.py` — Main CLI entry point
+- `agent.py` — Main CLI entry point with agentic loop
 - `.env.agent.secret` — LLM configuration (not committed to git)
-- `plans/task-1.md` — Implementation plan
+- `plans/task-1.md` — Task 1 implementation plan
+- `plans/task-2.md` — Task 2 implementation plan
 - `AGENT.md` — This documentation
+- `tests/test_agent.py` — Regression tests
